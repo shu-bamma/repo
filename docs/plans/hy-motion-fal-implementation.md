@@ -14,7 +14,7 @@
 | DevOps overhead (CUDA, model weights, scaling) | Pay-per-use, auto-scaling |
 | ~$1-3/hr GPU cost even when idle | Pay only when generating |
 | Full control over pipeline | Slightly less control, but simpler |
-| Free per-generation | ~$0.05-0.15 per generation (estimated) |
+| Free per-generation | **$0.08/gen (1B)**, **$0.06/gen (0.46B fast)** |
 
 **fal.ai provides:** Two model variants on their serverless GPU fleet:
 - `fal-ai/hunyuan-motion` — 1B parameter model (highest quality)
@@ -42,19 +42,19 @@
                                          |
                                          v
                               +---------------------+
-                              | SMPL-H Motion Data  |  Raw output: 22-joint SMPL-H skeleton
-                              | (BVH / joint data)  |
+                              | FBX Animation File  |  fal.ai returns: { fbx_file: { url }, seed }
+                              | (SMPL-H skeleton)   |  Download from fal.ai CDN
                               +----------+----------+
                                          |
                                          v
                               +---------------------+
-                              | Retarget Pipeline   |  Step 3: SMPL-H → Mixamo skeleton
-                              | (server-side)       |  - Bone remapping (22 → 65 joints)
-                              +----------+----------+  - T-pose alignment
-                                         |            - Scale normalization
-                                         v
+                              | Retarget + Convert  |  Step 3: FBX (SMPL-H) → GLB (Mixamo)
+                              | (server-side)       |  - Blender CLI or FBX2glTF
+                              +----------+----------+  - Bone remapping (22 → 65 joints)
+                                         |            - T-pose alignment
+                                         v            - Scale normalization
                               +---------------------+
-                              | GLB Export          |  Step 4: Export as GLB for Three.js
+                              | GLB Output          |  Step 4: Mixamo-rigged GLB for Three.js
                               +----------+----------+
                                          |
                                          v
@@ -129,7 +129,9 @@ PRESET_LIBRARY_DIR=./src/data/presets
 
 **1.1 — fal.ai API client wrapper** (`src/services/fal-client.ts`)
 
-The fal.ai SDK uses a `subscribe` pattern with queue-based async processing:
+The fal.ai SDK uses a `subscribe` pattern with queue-based async processing.
+
+**Confirmed API schema** (from research):
 
 ```typescript
 import { fal } from "@fal-ai/client";
@@ -137,34 +139,31 @@ import { fal } from "@fal-ai/client";
 // Configure authentication
 fal.config({ credentials: process.env.FAL_KEY });
 
+// --- CONFIRMED INPUT PARAMETERS ---
 interface HYMotionInput {
-  prompt: string;                    // Text description of motion (< 60 words, English)
-  num_inference_steps?: number;      // Diffusion steps (default ~50, lower = faster)
-  guidance_scale?: number;           // CFG scale (default ~7.5, higher = more prompt-adherent)
-  seed?: number;                     // Reproducibility (-1 for random)
-  duration?: number;                 // Motion duration in seconds (max ~10-12s)
+  prompt: string;           // Required. English only, < 60 words. Focus on action descriptions.
+  seed?: number;            // Optional. Default: random (0-999). For reproducibility.
+  duration?: number;        // Optional. Default: ~3.33s (100 frames @ 30fps). Max ~12s.
+  cfg_scale?: number;       // Optional. Default: 5.0. Higher = more prompt-adherent.
+  // NOTE: Some params from local_infer.py (num_seeds, disable_rewrite, validation_steps)
+  //       may NOT be exposed on fal.ai. Test to confirm.
 }
 
+// --- CONFIRMED OUTPUT SCHEMA ---
 interface HYMotionOutput {
-  motion_file: {                     // BVH or NPZ motion file
-    url: string;
-    content_type: string;
-    file_name: string;
-    file_size: number;
+  fbx_file: {
+    url: string;            // CDN URL to downloadable FBX file
+                            // e.g. "https://v3b.fal.media/files/b/0a885f1e/...000.fbx"
   };
-  video?: {                          // Optional preview video
-    url: string;
-    content_type: string;
-  };
+  seed: number;             // The seed used for this generation
 }
 
-// Subscribe pattern: submits to queue, polls, returns result
+// --- USAGE ---
 const result = await fal.subscribe("fal-ai/hunyuan-motion", {
   input: {
     prompt: "a person swinging a sword with both hands",
-    num_inference_steps: 50,
-    guidance_scale: 7.5,
-    seed: -1,
+    cfg_scale: 5.0,
+    seed: 42,
   },
   logs: true,
   onQueueUpdate: (update) => {
@@ -173,13 +172,18 @@ const result = await fal.subscribe("fal-ai/hunyuan-motion", {
     }
   },
 });
+
+console.log(result.data.fbx_file.url);  // FBX download URL
+console.log(result.data.seed);           // Seed used
 ```
 
-**Key considerations:**
+**Key facts:**
 - fal.ai queue pattern: `submit → IN_QUEUE → IN_PROGRESS → COMPLETED`
 - Subscribe handles polling automatically
-- Response likely contains a URL to a BVH/motion file hosted on fal.ai CDN
-- Fast variant (`fal-ai/hunyuan-motion/fast`) uses the 0.46B model — use for previews/drafts
+- **Output is FBX** (not BVH/NPZ/GLB) — industry-standard, needs conversion to GLB for Three.js
+- FBX contains SMPL-H skeleton animation (22 body joints, 30fps, no hand articulation)
+- Fast variant (`fal-ai/hunyuan-motion/fast`) uses the 0.46B model — $0.06/gen vs $0.08/gen
+- Built-in LLM modules handle prompt rewriting and auto duration estimation
 
 **1.2 — Input validation & prompt engineering**
 
@@ -210,9 +214,9 @@ Create a prompt sanitizer that:
 ### Phase 2: SMPL-H → Mixamo Retargeting Pipeline
 > Critical path: converting HY-Motion's output skeleton to Mixamo format
 
-**2.1 — Understanding the output format**
+**2.1 — Understanding the output format (CONFIRMED)**
 
-HY-Motion outputs **SMPL-H skeleton data** with 22 body joints:
+fal.ai returns an **FBX file** containing SMPL-H skeleton animation with 22 body joints (30fps, no hand articulation). Each frame is a 201-dimensional vector internally:
 ```
 Root (pelvis)
 ├── Left Hip → Left Knee → Left Ankle → Left Foot
@@ -268,31 +272,36 @@ const SMPL_TO_MIXAMO_MAP: Record<string, string> = {
 
 | Approach | Pros | Cons | Recommendation |
 |----------|------|------|----------------|
-| **A: Server-side Blender CLI** | Most reliable, battle-tested, handles edge cases | Requires Blender installed on server (~200MB), Python subprocess | **Recommended for production** |
-| **B: Server-side pure JS/TS** | No external deps, runs in Node.js | Must implement BVH parsing + retarget + GLB export from scratch | Good for MVP |
-| **C: Client-side Three.js** | Zero server processing | SkeletonUtils.retargetClip has known bugs, adds client load time | Not recommended |
+| **A: Server-side Blender CLI** | Most reliable, handles FBX import natively, retarget + GLB export in one step | Requires Blender on server (~200MB), Python subprocess | **Recommended for production** |
+| **B: FBX2glTF + runtime retarget** | Lighter deps, FBX→GLB conversion is fast | Retargeting must be done separately (Three.js SkeletonUtils or custom) | Good for MVP |
+| **C: Client-side Three.js FBXLoader** | Zero server processing, load FBX directly | FBXLoader less reliable than GLTFLoader, SkeletonUtils.retargetClip has bugs | Not recommended |
 
-**Recommended: Approach A (Blender CLI) for production, Approach B for MVP**
+**Recommended: Approach A (Blender CLI) for both MVP and production**
 
-**Approach B (MVP) implementation:**
-1. Download the BVH/motion file from fal.ai CDN URL
-2. Parse BVH (use `bvh-parser` npm package or custom parser)
-3. Map SMPL-H joints → Mixamo joints using the bone table
-4. For unmapped Mixamo joints (fingers etc.), use rest pose (identity quaternion)
-5. Handle T-pose vs A-pose offset (SMPL-H uses T-pose, Mixamo uses slight A-pose — apply shoulder rotation offset)
-6. Export as GLB using `@gltf-transform/core`
+Since the output is already FBX (not raw SMPL-H data), the pipeline is simpler than initially feared.
 
-**Approach A (Production) implementation:**
-1. Download BVH from fal.ai
+**Approach A implementation (recommended):**
+1. Download FBX from fal.ai CDN URL
 2. Run headless Blender with a Python retargeting script:
    ```bash
    blender --background --python retarget_smpl_to_mixamo.py -- \
-     --input motion.bvh \
+     --input motion.fbx \
      --output animation.glb \
      --target-rig mixamo
    ```
-3. The Blender script imports BVH, uses Auto-Rig Pro or custom bone mapping, exports GLB
+3. The Blender script:
+   - Imports FBX (Blender has native FBX support)
+   - Maps SMPL-H bones → Mixamo bones using the mapping table
+   - Applies T-pose → A-pose shoulder rotation offset
+   - Fills unmapped joints (fingers, toes) with rest pose
+   - Exports as GLB with embedded animation
 4. Return the GLB file
+
+**Approach B (lightweight alternative):**
+1. Download FBX from fal.ai CDN
+2. Convert FBX → GLB using [FBX2glTF](https://github.com/facebookincubator/FBX2glTF) CLI (`fbx2gltf -b -i input.fbx -o output.glb`)
+3. Load in Three.js, retarget at runtime using SkeletonUtils or skip retarget if bone names are acceptable
+4. Caveat: FBX2glTF doesn't retarget — bones stay as SMPL-H names
 
 **2.4 — Post-processing**
 
@@ -410,11 +419,10 @@ Client: GLTFLoader.load(clipUrl) → play on character
 POST /api/animations/generate
   Body: {
     prompt: string,           // Required: motion description
-    model?: "1b" | "fast",    // Default: "1b". Use "fast" for previews
-    seed?: number,            // Default: -1 (random)
-    duration?: number,        // Default: auto. Max 10s
-    steps?: number,           // Default: 50. Lower = faster but lower quality
-    guidance?: number,        // Default: 7.5
+    model?: "1b" | "fast",    // Default: "1b". Use "fast" for previews ($0.08 vs $0.06)
+    seed?: number,            // Default: random (0-999)
+    duration?: number,        // Default: auto (~3.33s). Max ~12s
+    cfg_scale?: number,       // Default: 5.0. Higher = more prompt-adherent
     useCache?: boolean,       // Default: true
   }
   Response: {
@@ -445,20 +453,16 @@ async function generateAnimation(request: GenerateRequest): Promise<GenerateResp
 
   const falResult = await falClient.generate(endpoint, {
     prompt: sanitizePrompt(request.prompt),
-    num_inference_steps: request.steps ?? 50,
-    guidance_scale: request.guidance ?? 7.5,
-    seed: request.seed ?? -1,
+    cfg_scale: request.guidance ?? 5.0,
+    seed: request.seed,
     duration: request.duration,
   });
 
-  // Step 4: Download motion file from fal.ai CDN
-  const motionData = await downloadMotionFile(falResult.motion_file.url);
+  // Step 4: Download FBX file from fal.ai CDN
+  const fbxBuffer = await downloadFile(falResult.fbx_file.url);
 
-  // Step 5: Retarget SMPL-H → Mixamo
-  const mixamoAnimation = await retargetToMixamo(motionData);
-
-  // Step 6: Export as GLB
-  const glbBuffer = await exportGLB(mixamoAnimation);
+  // Step 5: Retarget SMPL-H → Mixamo + convert FBX → GLB (Blender CLI)
+  const glbBuffer = await retargetAndConvert(fbxBuffer, { targetRig: "mixamo" });
 
   // Step 7: Cache and serve
   const clipUrl = await clipLibrary.store(glbBuffer, request.prompt, request.seed);
@@ -486,31 +490,41 @@ Phase 1 should be done first because the **exact fal.ai output format** (BVH? NP
 
 ---
 
-## Open Questions (to resolve in Phase 1)
+## Confirmed API Details (from research)
 
-1. **What exactly does `fal-ai/hunyuan-motion` return?**
-   - File URL to BVH? NPZ? Raw joint arrays in JSON?
-   - The fal.ai API page (blocked from this env) has the schema — test with a real API call first
-   - Run: `fal.subscribe("fal-ai/hunyuan-motion", { input: { prompt: "a person walking" } })` and inspect
+| Detail | Value |
+|--------|-------|
+| **Output format** | FBX file (SMPL-H skeleton, 22 joints, 30fps) |
+| **Output schema** | `{ fbx_file: { url: string }, seed: number }` |
+| **Pricing (1B)** | $0.08 per generation |
+| **Pricing (0.46B fast)** | $0.06 per generation |
+| **Default cfg_scale** | 5.0 |
+| **Default duration** | ~3.33s (100 frames @ 30fps), auto-estimated from prompt by built-in LLM |
+| **Max duration** | ~12 seconds |
+| **Frame data** | 201-dim vector/frame: 3D root pos + 6D root orient + 21×6D joint rotations + 22×3D joint positions |
+| **Prompt language** | English only, < 60 words |
+| **Not supported** | Multi-person, non-humanoid, loops, environment/camera descriptions |
 
-2. **Does fal.ai do any post-processing?**
-   - Some fal.ai model wrappers add conversion steps (e.g., outputting GLB directly)
-   - If they already output BVH, Phase 2 is simpler
-   - If they output raw SMPL-H NPZ, we need the full conversion pipeline
+## Remaining Open Questions
 
-3. **Pricing confirmation**
-   - fal.ai charges per-second of GPU time — need to benchmark cost per generation
-   - The 1B model likely costs more than the 0.46B fast variant
-   - Estimate: $0.05-0.20 per generation (based on similar fal.ai model costs)
-
-4. **Latency benchmarks**
+1. **Latency benchmarks**
    - Cold start (model loading): potentially 30-60s for first request
    - Warm inference: likely 5-15s per generation
    - Use `keep_alive` or schedule warm-up requests to avoid cold starts
+   - **Action:** Run test generation and measure end-to-end time
 
-5. **T-pose vs A-pose alignment**
+2. **Exact fal.ai-exposed parameters**
+   - We know `prompt` and `seed` are confirmed. `duration` and `cfg_scale` exist in the model but may not be exposed on fal.ai
+   - **Action:** Make a test API call with all parameters and check which are accepted
+
+3. **FBX bone naming convention**
+   - Need to inspect the actual FBX file to confirm exact SMPL-H bone names used
+   - This determines the bone mapping table accuracy
+   - **Action:** Download one FBX, open in Blender, list all bone names
+
+4. **T-pose vs A-pose alignment**
    - SMPL-H uses a specific rest pose — need to determine exact offset angles for Mixamo mapping
-   - Test with a simple "T-pose" prompt and compare joint orientations
+   - **Action:** Test with a "T-pose" prompt and compare joint orientations
 
 ---
 
@@ -518,8 +532,9 @@ Phase 1 should be done first because the **exact fal.ai output format** (BVH? NP
 
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| fal.ai output format is raw NPZ (hardest to convert) | High — need full SMPL conversion pipeline | Prototype Phase 1 first; if NPZ, add `smpl2bvh` step |
+| FBX bone names don't match expected SMPL-H naming | Medium — bone mapping table needs adjustment | Inspect actual FBX output in Blender; adapt mapping table |
 | Retargeting quality issues (foot sliding, jitter) | Medium — affects animation quality | Implement foot IK post-processing; allow quality review before caching |
+| Blender CLI adds server dependency (~200MB) | Low — acceptable for server-side | Use Docker image with Blender pre-installed; or use FBX2glTF as lighter alternative |
 | fal.ai cold start latency (~30-60s) | Medium — bad first-request UX | Pre-warm the model with a scheduled ping; use fast variant for previews |
 | fal.ai rate limits or downtime | Medium — blocks generation | Queue with retry; fallback to preset library; consider SayMotion as backup provider |
 | HY-Motion license (no EU/UK/South Korea) | High — legal risk | Verify with fal.ai whether their hosting changes license terms; consult legal |
@@ -527,23 +542,29 @@ Phase 1 should be done first because the **exact fal.ai output format** (BVH? NP
 
 ---
 
-## Next Step
+## Next Steps
 
-**Run a test generation against the fal.ai API** to confirm the output format:
+1. **Set up project** (Phase 0) — init TypeScript project, install deps
+2. **Test fal.ai API call** (Phase 1) — confirm which params are exposed, measure latency
+3. **Inspect FBX output** — download one FBX, open in Blender, list bone names to finalize mapping table
+4. **Build retargeting script** (Phase 2) — Blender Python script for SMPL-H FBX → Mixamo GLB
 
 ```typescript
+// Quick test script (run after Phase 0 setup)
 import { fal } from "@fal-ai/client";
 
-fal.config({ credentials: "YOUR_FAL_KEY" });
+fal.config({ credentials: process.env.FAL_KEY! });
 
 const result = await fal.subscribe("fal-ai/hunyuan-motion", {
-  input: { prompt: "a person walking forward" },
+  input: {
+    prompt: "a person walking forward slowly with arms swinging",
+    cfg_scale: 5.0,
+  },
   logs: true,
-  onQueueUpdate: (u) => console.log(u.status, u.logs),
+  onQueueUpdate: (u) => console.log(u.status),
 });
 
-console.log(JSON.stringify(result, null, 2));
-// ^^^ Inspect this output to determine exact schema before Phase 2
+console.log("FBX URL:", result.data.fbx_file.url);
+console.log("Seed:", result.data.seed);
+// Download the FBX and inspect in Blender to confirm bone names
 ```
-
-This single API call will answer Open Questions 1-2 and unblock the retargeting pipeline design.
