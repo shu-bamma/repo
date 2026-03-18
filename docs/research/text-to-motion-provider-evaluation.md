@@ -137,6 +137,38 @@
 
 ---
 
+### 6. Cartwheel (WATCH LIST)
+
+| Attribute | Detail |
+|-----------|--------|
+| **Type** | Hosted SaaS, browser-based |
+| **API** | Planned but NOT yet publicly available |
+| **Team** | Pixar/Riot Games veterans, backed by Jeffrey Katzenberg |
+| **Funding** | $15.6M |
+| **Input** | Text prompts (e.g. "cast a wizard spell", "do a silly dance") |
+| **Output** | Export to Maya, Unity, Unreal Engine (formats unclear) |
+| **Quality** | Used by DreamWorks, Duolingo, Sony, Roblox during beta. Powered by Google Gemini |
+| **Status** | Emerged from beta May 2025, 60,000+ waitlist |
+
+**Verdict:** Very promising team and backers, but no API yet. Worth monitoring — could become the best option once API ships.
+
+---
+
+### 7. Meshy (3D generation, NOT text-to-motion)
+
+| Attribute | Detail |
+|-----------|--------|
+| **Type** | Hosted SaaS, REST API |
+| **API** | Yes — [docs.meshy.ai](https://docs.meshy.ai). Text-to-3D, Image-to-3D, Auto-rigging + Animation |
+| **Input** | Text prompt for 3D model generation. Animation from 500+ pre-made library |
+| **Output** | GLB, FBX, OBJ, USDZ |
+| **Pricing** | Free: 100 credits/mo. Pro: $16/mo (1000 credits). Max: $48/mo (4000 credits) |
+| **Status** | GA (Meshy-6) |
+
+**Verdict:** NOT a text-to-motion generator — it generates 3D models from text, then applies pre-made animations from a library. Useful for generating character models but not for custom motion generation.
+
+---
+
 ### TIER 2: Self-Hosted Open Source
 
 ---
@@ -264,7 +296,7 @@ For common clips, avoid generation entirely:
 
 | Provider | Quality (1-10) | API Readiness | Latency | Cost per Clip | Mixamo Compat | GLB Native |
 |----------|----------------|---------------|---------|---------------|---------------|------------|
-| **SayMotion** | 7 | 9/10 (REST API, documented) | ~30-120s | ~$0.30-$3.00 | Good (built-in retarget) | Yes |
+| **SayMotion** | 7 | 9/10 (REST API, documented) | ~15-25s | ~$0.30-$3.00 | Good (built-in retarget) | Yes |
 | **HY-Motion 1.0** | 9 | 5/10 (self-host, wrap in API) | ~10-30s (on GPU) | GPU cost only | Needs retarget tool | Via export tool |
 | **Kinetix** | 7 | 6/10 (text API upcoming) | Unknown | $0.20/emote | Excellent (Mixamo partner) | glTF yes |
 | **Mootion** | 7 | 5/10 (API exists, sparse docs) | Unknown | ~$0.01-0.05/credit | Good | Yes |
@@ -345,3 +377,8 @@ For common clips, avoid generation entirely:
 - [Quaternius Universal Animation Library](https://quaternius.itch.io/universal-animation-library)
 - [Mesh2Motion](https://gamefromscratch.com/mesh2motion-open-source-mixamo-alternative/)
 - [ComfyUI-HY-Motion1](https://github.com/jtydhr88/ComfyUI-HY-Motion1)
+- [Cartwheel](https://getcartwheel.com/)
+- [Cartwheel Launch (Deadline)](https://deadline.com/2025/05/ai-animation-firm-cartwheel-emerges-from-beta-pixar-jeffrey-katzenberg-1236404797/)
+- [Meshy API](https://docs.meshy.ai)
+- [ARP-Batch-Retargeting (SMPL to Mixamo)](https://github.com/Shimingyi/ARP-Batch-Retargeting)
+- [smpl2bvh Converter](https://github.com/KosukeFukazawa/smpl2bvh)
